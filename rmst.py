@@ -5,7 +5,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
-os.chdir('')# enter input file directory
+os.chdir('')# enter working directory
 
 # =========================================================================
 # 1. DYNAMICALLY GENERATE THE CONFIGURATION DICTIONARY
