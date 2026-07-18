@@ -5,7 +5,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
-os.chdir('')# enter working directory
+os.chdir('/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/data/input/')# enter input file directory
 
 # =========================================================================
 # 1. DYNAMICALLY GENERATE THE CONFIGURATION DICTIONARY
@@ -20,10 +20,10 @@ covariates_str = " + ".join(covariates)
 
 pps = ['pp0', 'pp1', 'pp2']
 endpoints = {
-    'aki': {'file': 'aki_df_260415.csv', 'tau': 4.0},
-    'mace': {'file': 'mace_df_260415.csv', 'tau': 6.0},
-    'itching': {'file': 'itching_df_260415.csv', 'tau': 6.0},
-    'urticaria': {'file': 'urticaria_df_260415.csv', 'tau': 6.0}
+    'aki': {'file': 'aki_df_260710.csv', 'tau': 4.0},
+    'mace': {'file': 'mace_df_260710.csv', 'tau': 6.0},
+    'itching': {'file': 'itching_df_260710.csv', 'tau': 6.0},
+    'urticaria': {'file': 'urticaria_df_260710.csv', 'tau': 6.0}
 }
 cohorts = ['older', 'younger', 'overall']
 model_types = ['covariatesadjusted', 'crude']
@@ -129,8 +129,7 @@ for ade_name, config in ades_config.items():
     
     # Fast date calculation
     iptw_df['time'] = (pd.to_datetime(iptw_df['end_date']) - pd.to_datetime(iptw_df['search_start'])).dt.days
-    iptw_df.loc[iptw_df['time'] < 0, 'time'] = tau
-    
+
     # Step C: Compute Fast Pseudo-values using the unique profile trick
     iptw_df['rmst_pseudo'] = compute_pseudo_obs_large_sample(iptw_df, 'time', event_col, tau)
     
@@ -174,9 +173,8 @@ if all_results:
     final_results_df['Cohort'] = final_results_df['Endpoint'].apply(lambda x: x.split('_')[2])
     final_results_df['Adjustment_Type'] = final_results_df['Endpoint'].apply(lambda x: x.split('_')[-1])
 
-    # 2. Define the Target Slice: ONLY pp0, ONLY adjusted models, and ONLY main effects
-    # This isolates exactly 12 models (3 cohorts x 4 AEs)
-# Pool 1: Main Effects Only (n = 36 rows)
+    # 2. Define the Target Slices for Adjusted Models
+    # Pool 1: Main Effects Only (n = 36 rows)
     primary_mask = (
         (final_results_df['Polypharmacy_System'] == 'pp0') &
         (final_results_df['Adjustment_Type'] == 'covariatesadjusted') & 
@@ -190,38 +188,76 @@ if all_results:
         (final_results_df['Adjustment_Type'] == 'covariatesadjusted') & 
         (final_results_df['Model Term'].str.contains(':'))
     )
-    # 3. Apply Benjamini-Hochberg FDR correction exclusively to the pp0 slice
+
+    # --- NEW: Define Target Slices for Crude Models ---
+    # Crude Pool 1: Main Effects Only
+    crude_primary_mask = (
+        (final_results_df['Polypharmacy_System'] == 'pp0') &
+        (final_results_df['Adjustment_Type'] == 'crude') & 
+        (final_results_df['Model Term'].str.contains('C\(group\)')) &
+        (~final_results_df['Model Term'].str.contains(':'))
+    )
+    
+    # Crude Pool 2: Interaction Effects Only
+    crude_interaction_mask = (
+        (final_results_df['Polypharmacy_System'] == 'pp0') &
+        (final_results_df['Adjustment_Type'] == 'crude') & 
+        (final_results_df['Model Term'].str.contains(':'))
+    )
+
+    # 3. Apply Benjamini-Hochberg FDR correction exclusively to the pp0 slices
     final_results_df['FDR_Adjusted_Q_Value'] = np.nan
     final_results_df['Significant_After_FDR'] = False
     
+    # Initialize separate tracking columns for independent crude corrections
+    final_results_df['FDR_Adjusted_Q_Value_Crude'] = np.nan
+    final_results_df['Significant_After_FDR_Crude'] = False
+    
     import statsmodels.stats.multitest as smm
-  # Apply FDR to Main Effects
+    
+    # Apply FDR to Adjusted Main Effects
     if primary_mask.any():
         raw_p_main = final_results_df.loc[primary_mask, 'P-Value'].to_numpy()
         rej_main, q_main, _, _ = smm.multipletests(raw_p_main, alpha=0.05, method='fdr_bh')
         final_results_df.loc[primary_mask, 'FDR_Adjusted_Q_Value'] = q_main
         final_results_df.loc[primary_mask, 'Significant_After_FDR'] = rej_main
 
-    # Apply FDR to Interaction Effects separately
+    # Apply FDR to Adjusted Interaction Effects separately
     if interaction_mask.any():
         raw_p_inter = final_results_df.loc[interaction_mask, 'P-Value'].to_numpy()
         rej_inter, q_inter, _, _ = smm.multipletests(raw_p_inter, alpha=0.05, method='fdr_bh')
         final_results_df.loc[interaction_mask, 'FDR_Adjusted_Q_Value'] = q_inter
         final_results_df.loc[interaction_mask, 'Significant_After_FDR'] = rej_inter
+
+    # --- NEW: Apply Independent FDR Corrections to Crude Pools ---
+    # Apply FDR to Crude Main Effects
+    if crude_primary_mask.any():
+        raw_p_crude_main = final_results_df.loc[crude_primary_mask, 'P-Value'].to_numpy()
+        rej_crude_main, q_crude_main, _, _ = smm.multipletests(raw_p_crude_main, alpha=0.05, method='fdr_bh')
+        final_results_df.loc[crude_primary_mask, 'FDR_Adjusted_Q_Value_Crude'] = q_crude_main
+        final_results_df.loc[crude_primary_mask, 'Significant_After_FDR_Crude'] = rej_crude_main
+
+    # Apply FDR to Crude Interaction Effects separately
+    if crude_interaction_mask.any():
+        raw_p_crude_inter = final_results_df.loc[crude_interaction_mask, 'P-Value'].to_numpy()
+        rej_crude_inter, q_crude_inter, _, _ = smm.multipletests(raw_p_crude_inter, alpha=0.05, method='fdr_bh')
+        final_results_df.loc[crude_interaction_mask, 'FDR_Adjusted_Q_Value_Crude'] = q_crude_inter
+        final_results_df.loc[crude_interaction_mask, 'Significant_After_FDR_Crude'] = rej_crude_inter
         
-    # 4. Reorder columns for optimal readability
+    # 4. Reorder columns for optimal readability including new crude outputs
     col_order = [
         'Endpoint', 'Polypharmacy_System', 'Adverse_Event', 'Cohort', 'Adjustment_Type',
         'Time Horizon (Tau)', 'Model Term', 'Coefficient (Days)', 'Lower 95% CI', 'Upper 95% CI', 
-        'P-Value', 'FDR_Adjusted_Q_Value', 'Significant_After_FDR'
+        'P-Value', 'FDR_Adjusted_Q_Value', 'Significant_After_FDR',
+        'FDR_Adjusted_Q_Value_Crude', 'Significant_After_FDR_Crude'
     ]
     final_results_df = final_results_df[col_order]
 
     # 5. Export to disk
-    output_path_csv = "RMST_Multiple_Jittering_Endpoints_Results.csv"
-    output_path_xlsx = "RMST_Multiple_Jittering_Endpoints_Results.xlsx"
+    output_path_csv = "/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/results/output/iptw_applied/rmst/RMST_Multiple_Jittering_Endpoints_Results.csv"
+    output_path_xlsx = "/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/results/output/iptw_applied/rmst/RMST_Multiple_Jittering_Endpoints_Results.xlsx"
     
     final_results_df.to_csv(output_path_csv, index=False)
     final_results_df.to_excel(output_path_xlsx, index=False)
     
-    print(f"\n✅ Done! Combined matrix compiled. FDR correction applied to pp0; pp1 and pp2 left as sensitivity checks.")
+    print(f"\n✅ Done! Combined matrix compiled. FDR corrections independently applied to both adjusted and crude pp0 models.")
