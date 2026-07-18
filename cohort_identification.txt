@@ -1,0 +1,1390 @@
+/* =============================================================================
+   COHORT IDENTIFICATION SCRIPT (OMOP CDM, PostgreSQL)
+   =============================================================================
+   Pipeline overview:
+     PART 1. Base cohort construction
+       - Cohort entry: inpatient visits (visit_concept_id = 9201) starting
+         between 2019-01-01 and 2023-12-31
+       - index_date: within any inpatient stay, the earliest date with the
+         maximum number of distinct active drug ingredients per day
+       - Inclusion: age >= 20 at index_date; >= 1 visit within 1 year prior
+       - Exclusion: ESRD, hospice/palliative care, clinical-trial drug exposure
+     PART 2. Outcome-specific cohorts (built on the base cohort)
+       - Each outcome applies its own exclusion criteria, defines a search
+         window anchored to the earliest end date of drugs overlapping
+         index_date, and flags the Health Outcome of Interest (HOI):
+           1) Cardiac arrest   2) Urticaria   3) MACE
+           4) Itching/Pruritus 5) AKI (Acute Kidney Injury)
+   ============================================================================= */
+
+
+/* =============================================================================
+   PART 1. BASE COHORT
+   ============================================================================= */
+
+-- (Optional check) Number of patients with an inpatient visit in 2019-2023
+-- Expected n = 414,076
+-- SELECT COUNT(DISTINCT v.person_id)
+-- FROM cdm.visit_occurrence v
+-- WHERE v.visit_concept_id = 9201
+--   AND v.visit_start_date::date BETWEEN DATE '2019-01-01' AND DATE '2023-12-31';
+
+
+/* -----------------------------------------------------------------------------
+   1) Inpatient visits starting in 2019-2023 (visit_concept_id = 9201)
+      n = 414,076 visits
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS inpatient_visits_19_23;
+CREATE TEMP TABLE inpatient_visits_19_23 AS
+SELECT
+  v.visit_occurrence_id,
+  v.person_id,
+  v.visit_start_date::date AS visit_start_date,
+  COALESCE(v.visit_end_date::date, v.visit_start_date::date) AS visit_end_date
+FROM cdm.visit_occurrence v
+WHERE v.visit_concept_id = 9201
+  AND v.visit_start_date::date BETWEEN DATE '2019-01-01' AND DATE '2023-12-31';
+
+
+/* -----------------------------------------------------------------------------
+   2) Patients with an inpatient stay in 2019-2023 + demographics
+      n = 414,063 persons
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS cohort_persons;
+CREATE TEMP TABLE cohort_persons AS
+SELECT DISTINCT
+  p.person_id,
+  p.year_of_birth,
+  p.month_of_birth,
+  p.day_of_birth,
+  p.gender_source_value
+FROM inpatient_visits_19_23 iv
+JOIN cdm.person p ON p.person_id = iv.person_id;
+
+
+/* -----------------------------------------------------------------------------
+   3) Excluded drug concept set (seed ancestors -> standard descendants)
+      Drugs in this set are ignored when counting ingredients and when
+      building exposure windows.
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS seed_drug_excl_ancestors;
+CREATE TEMP TABLE seed_drug_excl_ancestors AS
+SELECT unnest(ARRAY[
+  21600800, 21602384, 21600857, 21601179, 21605348,
+  21601278, 21605295, 21605372, 21605444, 21601185
+]) AS ancestor_concept_id;
+
+DROP TABLE IF EXISTS excluded_drug_descendants;
+CREATE TEMP TABLE excluded_drug_descendants AS
+SELECT DISTINCT ca.descendant_concept_id AS drug_concept_id
+FROM seed_drug_excl_ancestors s
+JOIN cdm.concept_ancestor ca
+  ON ca.ancestor_concept_id = s.ancestor_concept_id
+JOIN cdm.concept cd
+  ON cd.concept_id = ca.descendant_concept_id
+WHERE cd.domain_id = 'Drug'
+  AND cd.standard_concept = 'S';
+
+
+/* -----------------------------------------------------------------------------
+   4) Daily distinct ingredient counts during inpatient stays
+      - For each (person, date), count DISTINCT standard Ingredient-level
+        ancestors of the drugs exposed on that date.
+      - Only dates falling within any inpatient stay (start ~ end) are kept;
+        counting at (person_id, drug_date) level avoids double counting when
+        a date matches multiple overlapping visits.
+      - Excludes: topical route ('OIN') and the excluded drug set above.
+      - Runtime: ~10 min
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS inpatient_daily_ingredient_counts;
+CREATE TEMP TABLE inpatient_daily_ingredient_counts AS
+SELECT
+  de.person_id,
+  de.drug_exposure_start_date::date AS drug_date,
+  COUNT(DISTINCT ca.ancestor_concept_id) AS ingredient_cnt
+FROM cdm.drug_exposure de
+JOIN cdm.concept_ancestor ca
+  ON ca.descendant_concept_id = de.drug_concept_id
+JOIN cdm.concept c_anc
+  ON c_anc.concept_id = ca.ancestor_concept_id
+ AND c_anc.domain_id = 'Drug'
+ AND c_anc.concept_class_id = 'Ingredient'
+ AND c_anc.standard_concept = 'S'
+LEFT JOIN excluded_drug_descendants x
+  ON x.drug_concept_id = de.drug_concept_id
+WHERE de.drug_exposure_start_date::date BETWEEN DATE '2019-01-01' AND DATE '2023-12-31'
+  AND COALESCE(de.route_source_value, '') <> 'OIN'  -- exclude ointment route
+  AND x.drug_concept_id IS NULL                     -- anti-join: excluded drugs
+  -- drug_date must fall within at least one inpatient stay
+  AND EXISTS (
+    SELECT 1
+    FROM inpatient_visits_19_23 iv
+    WHERE iv.person_id = de.person_id
+      AND de.drug_exposure_start_date::date BETWEEN iv.visit_start_date AND iv.visit_end_date
+  )
+GROUP BY
+  de.person_id,
+  de.drug_exposure_start_date::date;
+
+
+/* -----------------------------------------------------------------------------
+   5) index_date per person
+      - The date with the maximum ingredient_cnt across all inpatient days.
+      - Tie-break: ingredient_cnt DESC, drug_date ASC (earliest date wins).
+      - Keep only persons with ingredient_cnt >= 1.
+      n = 412,601
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS index_date_per_person;
+CREATE TEMP TABLE index_date_per_person AS
+SELECT
+  person_id,
+  drug_date AS index_date,
+  ingredient_cnt AS max_ingredient_cnt
+FROM (
+  SELECT
+    d.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY d.person_id
+      ORDER BY d.ingredient_cnt DESC, d.drug_date ASC
+    ) AS rn
+  FROM inpatient_daily_ingredient_counts d
+  WHERE d.ingredient_cnt >= 1
+) s
+WHERE rn = 1;
+
+
+/* -----------------------------------------------------------------------------
+   6) Inclusion: age >= 20 at index_date
+      - age = year(index_date) - year_of_birth
+      n = 369,037
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS eligible_cohort_2;
+CREATE TEMP TABLE eligible_cohort_2 AS
+SELECT
+  cp.person_id,
+  cp.year_of_birth,
+  cp.month_of_birth,
+  cp.day_of_birth,
+  cp.gender_source_value,
+  i.index_date,
+  i.max_ingredient_cnt,
+  date_part('year', i.index_date) - cp.year_of_birth AS age
+FROM cohort_persons cp
+JOIN index_date_per_person i
+  ON i.person_id = cp.person_id
+WHERE (date_part('year', i.index_date) - cp.year_of_birth) >= 20;
+
+
+/* -----------------------------------------------------------------------------
+   7) Inclusion: >= 1 visit within 365 days before index_date
+      (index_date - 365 ~ index_date - 1)
+      n = 366,595
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS eligible_cohort_3;
+CREATE TEMP TABLE eligible_cohort_3 AS
+SELECT DISTINCT e2.*
+FROM eligible_cohort_2 e2
+JOIN cdm.visit_occurrence v
+  ON v.person_id = e2.person_id
+ AND v.visit_start_date BETWEEN (e2.index_date - INTERVAL '365 days')
+                            AND (e2.index_date - INTERVAL '1 day');
+
+
+/* =============================================================================
+   PART 1 - EXCLUSION CRITERIA
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   E1) ESRD concept sets (seed -> standard descendants)
+----------------------------------------------------------------------------- */
+-- ESRD: Condition domain
+DROP TABLE IF EXISTS seed_esrd_condition;
+CREATE TEMP TABLE seed_esrd_condition AS
+SELECT 193782 AS concept_id;  -- End-stage renal disease
+
+DROP TABLE IF EXISTS esrd_condition_concepts_std;
+CREATE TEMP TABLE esrd_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_esrd_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_esrd_condition;
+
+-- ESRD: Procedure domain (renal dialysis)
+DROP TABLE IF EXISTS seed_esrd_procedure;
+CREATE TEMP TABLE seed_esrd_procedure AS
+SELECT 4146536 AS concept_id;  -- Renal dialysis
+
+DROP TABLE IF EXISTS esrd_procedure_concepts_std;
+CREATE TEMP TABLE esrd_procedure_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_esrd_procedure s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Procedure'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_esrd_procedure;
+
+
+/* -----------------------------------------------------------------------------
+   E2) Hospice/Palliative care concept sets (seed -> standard descendants)
+----------------------------------------------------------------------------- */
+-- Hospice/Palliative: Observation domain
+DROP TABLE IF EXISTS seed_hospice_observation;
+CREATE TEMP TABLE seed_hospice_observation AS
+SELECT DISTINCT unnest(ARRAY[
+  40483762,4123927,763387,507651,4137269,4137272,765654,762516,4062333,
+  40481548,4301458,3044388,40758143,40758142,44811997,40770944,37394016,
+  44788856,4140947,4062044,42539268,765378,42535354,42535353,42535355,
+  763911,761920,763907,765625,764249,35610382,4023144,44790923,44808854,
+  44788886,4138195,4193678,4217584,4212796,4216795,4194403,40480924,
+  4140770,4139889,44788855,44802361,44811451,4190558,4179711,
+  4149138,44809560,4147093,44793045,4014023,4186545,44802116,44792926,
+  35609063,762883,4144354,44807744,4127923,4191843,40483222,4138045
+]) AS concept_id;
+
+DROP TABLE IF EXISTS hospice_observation_concepts_std;
+CREATE TEMP TABLE hospice_observation_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_hospice_observation s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Observation'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_hospice_observation;
+
+-- Hospice/Palliative: Procedure domain
+DROP TABLE IF EXISTS seed_hospice_procedure;
+CREATE TEMP TABLE seed_hospice_procedure AS
+SELECT unnest(ARRAY[
+  4301459, 37208425, 35609567, 44810824, 4341092, 4176643,
+  762572, 37016858, 4057754, 4151582, 44788770, 42535342
+]) AS concept_id;
+
+DROP TABLE IF EXISTS hospice_procedure_concepts_std;
+CREATE TEMP TABLE hospice_procedure_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_hospice_procedure s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Procedure'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_hospice_procedure;
+
+-- Hospice/Palliative: Condition domain
+DROP TABLE IF EXISTS seed_hospice_condition;
+CREATE TEMP TABLE seed_hospice_condition AS
+SELECT unnest(ARRAY[
+  40486976, 4197586, 45770574
+]) AS concept_id;
+
+DROP TABLE IF EXISTS hospice_condition_concepts_std;
+CREATE TEMP TABLE hospice_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_hospice_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_hospice_condition;
+
+
+/* -----------------------------------------------------------------------------
+   E3) Apply exclusions (events on or before index_date)
+----------------------------------------------------------------------------- */
+-- Exclusion: ESRD or dialysis on/before index_date (runtime: ~48 min)
+DROP TABLE IF EXISTS excl_esrd;
+CREATE TEMP TABLE excl_esrd AS
+SELECT DISTINCT e.person_id
+FROM (SELECT DISTINCT e3.person_id, e3.index_date FROM eligible_cohort_3 e3) e
+LEFT JOIN cdm.condition_occurrence co
+  ON co.person_id = e.person_id
+ AND co.condition_concept_id IN (SELECT concept_id FROM esrd_condition_concepts_std)
+ AND co.condition_start_date::date <= e.index_date
+LEFT JOIN cdm.procedure_occurrence po
+  ON po.person_id = e.person_id
+ AND po.procedure_concept_id IN (SELECT concept_id FROM esrd_procedure_concepts_std)
+ AND po.procedure_date::date <= e.index_date
+WHERE co.person_id IS NOT NULL OR po.person_id IS NOT NULL;
+
+-- Exclusion: hospice/palliative care on/before index_date (runtime: ~3 min)
+DROP TABLE IF EXISTS excl_hospice;
+CREATE TEMP TABLE excl_hospice AS
+SELECT DISTINCT e.person_id
+FROM (SELECT DISTINCT e3.person_id, e3.index_date FROM eligible_cohort_3 e3) e
+LEFT JOIN cdm.observation o
+  ON o.person_id = e.person_id
+ AND o.observation_concept_id IN (SELECT concept_id FROM hospice_observation_concepts_std)
+ AND o.observation_date::date <= e.index_date
+LEFT JOIN cdm.procedure_occurrence pp
+  ON pp.person_id = e.person_id
+ AND pp.procedure_concept_id IN (SELECT concept_id FROM hospice_procedure_concepts_std)
+ AND pp.procedure_date::date <= e.index_date
+LEFT JOIN cdm.condition_occurrence cc
+  ON cc.person_id = e.person_id
+ AND cc.condition_concept_id IN (SELECT concept_id FROM hospice_condition_concepts_std)
+ AND cc.condition_start_date::date <= e.index_date
+WHERE o.person_id IS NOT NULL
+   OR pp.person_id IS NOT NULL
+   OR cc.person_id IS NOT NULL;
+
+-- Exclusion: clinical-trial drug exposure on/before index_date (runtime: ~7 min)
+-- drug_type_concept_id = 44777970 ('Randomized drug')
+DROP TABLE IF EXISTS excl_clintrial;
+CREATE TEMP TABLE excl_clintrial AS
+SELECT DISTINCT e.person_id
+FROM (SELECT DISTINCT e3.person_id, e3.index_date FROM eligible_cohort_3 e3) e
+JOIN cdm.drug_exposure de
+  ON de.person_id = e.person_id
+ AND de.drug_type_concept_id = 44777970
+ AND de.drug_exposure_start_date::date <= e.index_date;
+
+
+/* -----------------------------------------------------------------------------
+   BASE COHORT (after all exclusions)
+   n = 355,235 rows / 305,722 distinct persons
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS base_cohort;
+CREATE TEMP TABLE base_cohort AS
+SELECT *
+FROM eligible_cohort_3 ec
+WHERE NOT EXISTS (SELECT 1 FROM excl_esrd      e WHERE e.person_id = ec.person_id)
+  AND NOT EXISTS (SELECT 1 FROM excl_hospice   e WHERE e.person_id = ec.person_id)
+  AND NOT EXISTS (SELECT 1 FROM excl_clintrial e WHERE e.person_id = ec.person_id);
+
+-- Validation:
+-- SELECT COUNT(DISTINCT person_id) FROM base_cohort;  -- n = 305,722
+
+
+/* =============================================================================
+   PART 2. OUTCOME-SPECIFIC COHORTS
+   =============================================================================
+   Common pattern for each outcome:
+     1) Apply outcome-specific exclusion criteria to base_cohort
+     2) Find prescriptions overlapping index_date (excluded drug set removed)
+     3) anchor_end = earliest exposure end date among those prescriptions
+        search window = (anchor_end + offset_start) ~ (anchor_end + offset_end)
+     4) Flag HOI events occurring within the search window
+   ============================================================================= */
+
+
+/* =============================================================================
+   OUTCOME 1. CARDIAC ARREST
+   - Exclusion: MI / stroke / HF within 30 days before index_date
+                (index_date - 30 ~ index_date - 1)
+   - Search window: (anchor_end + 1) ~ (anchor_end + 7)
+   - HOI: (cardiac arrest dx during an inpatient visit) AND
+          (CPR or defibrillation procedure, any setting), both within window
+   ============================================================================= */
+
+/* C0) Pre-existing cardiac condition concept set (std + descendants) */
+DROP TABLE IF EXISTS seed_cardiac_condition;
+CREATE TEMP TABLE seed_cardiac_condition AS
+SELECT unnest(ARRAY[
+  312327, -- Myocardial infarction
+  381316, -- Stroke
+  316139  -- Heart failure
+]) AS concept_id;
+
+DROP TABLE IF EXISTS cardiac_condition_concepts_std;
+CREATE TEMP TABLE cardiac_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_cardiac_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_cardiac_condition;
+
+
+/* C1) Exclude pre-existing cardiac conditions within 30 days before index_date
+      (runtime: ~18 min)  n = 300,919 */
+DROP TABLE IF EXISTS cardiac_cohort;
+CREATE TEMP TABLE cardiac_cohort AS
+SELECT bc.*
+FROM base_cohort bc
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM cdm.condition_occurrence co
+  WHERE co.person_id = bc.person_id
+    AND co.condition_concept_id IN (SELECT concept_id FROM cardiac_condition_concepts_std)
+    AND co.condition_start_date::date BETWEEN (bc.index_date::date - INTERVAL '30 days')
+                                          AND (bc.index_date::date - INTERVAL '1 day')
+);
+
+
+/* C2) Prescriptions overlapping index_date (runtime: ~30 min)
+      - drug_exposure pre-filtered to 2019-2023 for performance
+      - excluded drug set removed */
+DROP TABLE IF EXISTS drug_exposure_2023;
+CREATE TEMP TABLE drug_exposure_2023 AS
+SELECT person_id, drug_exposure_start_date, drug_exposure_end_date, drug_concept_id
+FROM cdm.drug_exposure
+WHERE drug_exposure_start_date::date BETWEEN '2019-01-01' AND '2023-12-31';
+
+DROP TABLE IF EXISTS exposure_on_index;
+CREATE TEMP TABLE exposure_on_index AS
+SELECT
+  c.person_id,
+  c.index_date::date AS index_date,
+  d.drug_concept_id,
+  d.drug_exposure_start_date::date AS exposure_start_raw,
+  COALESCE(d.drug_exposure_end_date, d.drug_exposure_start_date)::date AS exposure_end_raw
+FROM base_cohort c
+JOIN drug_exposure_2023 d
+  ON d.person_id = c.person_id
+ AND c.index_date::date BETWEEN d.drug_exposure_start_date::date
+                            AND COALESCE(d.drug_exposure_end_date, d.drug_exposure_start_date)::date
+WHERE d.drug_concept_id NOT IN (SELECT drug_concept_id FROM excluded_drug_descendants);
+
+
+/* C3) Search window: anchor_end = earliest exposure end;
+      window = (anchor_end + 1) ~ (anchor_end + 7)
+      NOTE: shared by the Cardiac arrest, Urticaria, and Itching outcomes. */
+DROP TABLE IF EXISTS search_window_1_7;
+CREATE TEMP TABLE search_window_1_7 AS
+SELECT
+  person_id,
+  index_date,
+  MIN(exposure_end_raw) AS anchor_end_date,
+  (MIN(exposure_end_raw) + INTERVAL '1 day')::date AS search_start,
+  (MIN(exposure_end_raw) + INTERVAL '7 day')::date AS search_end
+FROM exposure_on_index
+GROUP BY person_id, index_date;
+
+
+/* C4-1) Cardiac arrest diagnoses during inpatient visits
+        (Condition 321042 + descendants; visit 9201 + descendants) */
+DROP TABLE IF EXISTS arrest_in_inpatient;
+CREATE TEMP TABLE arrest_in_inpatient AS
+SELECT
+  co.person_id,
+  co.condition_start_date::date AS arrest_date
+FROM cdm.condition_occurrence co
+JOIN cdm.visit_occurrence vo
+  ON vo.visit_occurrence_id = co.visit_occurrence_id
+WHERE co.condition_concept_id IN (
+  SELECT descendant_concept_id
+  FROM cdm.concept_ancestor
+  WHERE ancestor_concept_id = 321042  -- Cardiac arrest
+  UNION
+  SELECT 321042
+)
+AND vo.visit_concept_id IN (
+  SELECT descendant_concept_id
+  FROM cdm.concept_ancestor
+  WHERE ancestor_concept_id = 9201    -- Inpatient visit
+  UNION
+  SELECT 9201
+);
+
+
+/* C4-2) CPR or defibrillation procedures, any care setting */
+DROP TABLE IF EXISTS resus_anywhere;
+CREATE TEMP TABLE resus_anywhere AS
+SELECT
+  po.person_id,
+  po.procedure_date::date AS resus_date,
+  po.procedure_concept_id
+FROM cdm.procedure_occurrence po
+WHERE po.procedure_concept_id IN (
+  SELECT descendant_concept_id
+  FROM cdm.concept_ancestor
+  WHERE ancestor_concept_id = 4232320  -- CPR
+  UNION
+  SELECT 4232320
+  UNION
+  SELECT descendant_concept_id
+  FROM cdm.concept_ancestor
+  WHERE ancestor_concept_id = 4138751  -- Defibrillation
+  UNION
+  SELECT 4138751
+);
+
+
+/* C5) Final: cardiac cohort with HOI flag
+      hoi_flag = 1 only if BOTH events occur within the search window:
+        (inpatient cardiac arrest dx) AND (CPR/defibrillation procedure) */
+DROP TABLE IF EXISTS cardiac_cohort_with_hoi;
+CREATE TEMP TABLE cardiac_cohort_with_hoi AS
+SELECT
+  cc.person_id,
+  cc.index_date,
+  w.anchor_end_date,
+  w.search_start,
+  w.search_end,
+  -- earliest arrest date within window
+  (
+    SELECT MIN(a.arrest_date)
+    FROM arrest_in_inpatient a
+    WHERE a.person_id = cc.person_id
+      AND a.arrest_date BETWEEN w.search_start AND w.search_end
+  ) AS arrest_date_in_window,
+  -- earliest resuscitation date within window
+  (
+    SELECT MIN(r.resus_date)
+    FROM resus_anywhere r
+    WHERE r.person_id = cc.person_id
+      AND r.resus_date BETWEEN w.search_start AND w.search_end
+  ) AS resus_date_in_window,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM arrest_in_inpatient a
+      WHERE a.person_id = cc.person_id
+        AND a.arrest_date BETWEEN w.search_start AND w.search_end
+    )
+    AND EXISTS (
+      SELECT 1 FROM resus_anywhere r
+      WHERE r.person_id = cc.person_id
+        AND r.resus_date BETWEEN w.search_start AND w.search_end
+    )
+    THEN 1 ELSE 0
+  END AS hoi_flag
+FROM cardiac_cohort cc
+JOIN search_window_1_7 w
+  ON w.person_id = cc.person_id
+ AND w.index_date = cc.index_date;
+
+
+/* =============================================================================
+   OUTCOME 2. URTICARIA
+   - Exclusion: urticaria dx within 6 weeks before index_date
+                (index_date - 6 weeks ~ index_date - 1 day)
+   - Search window: (anchor_end + 1) ~ (anchor_end + 7)  [reuses search_window_1_7]
+   - HOI: (urticaria dx) AND (H1-antihistamine rx) where rx_date >= dx_date + 1
+   ============================================================================= */
+
+/* U0) Urticaria concept set (Condition, std + descendants) */
+DROP TABLE IF EXISTS seed_urti_condition;
+CREATE TEMP TABLE seed_urti_condition AS
+SELECT 139900 AS concept_id;  -- Urticaria
+
+DROP TABLE IF EXISTS urti_condition_concepts_std;
+CREATE TEMP TABLE urti_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_urti_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_urti_condition;
+
+
+/* U1) Exclusion: urticaria within 6 weeks before index_date */
+DROP TABLE IF EXISTS urti_cohort;
+CREATE TEMP TABLE urti_cohort AS
+SELECT bc.*
+FROM base_cohort bc
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM cdm.condition_occurrence co
+  WHERE co.person_id = bc.person_id
+    AND co.condition_concept_id IN (SELECT concept_id FROM urti_condition_concepts_std)
+    AND co.condition_start_date BETWEEN (bc.index_date - INTERVAL '6 weeks')
+                                    AND (bc.index_date - INTERVAL '1 day')
+);
+
+
+/* U2) Urticaria dx events (restricted to persons with a search window) */
+DROP TABLE IF EXISTS urticaria_dx_events;
+CREATE TEMP TABLE urticaria_dx_events AS
+SELECT
+  co.person_id,
+  co.condition_start_date::date AS dx_date,
+  co.condition_concept_id       AS dx_concept_id
+FROM cdm.condition_occurrence co
+WHERE co.person_id IN (SELECT DISTINCT person_id FROM search_window_1_7)
+  AND co.condition_concept_id IN (
+    SELECT descendant_concept_id
+    FROM cdm.concept_ancestor
+    WHERE ancestor_concept_id = 139900
+    UNION
+    SELECT 139900
+  );
+
+
+/* U3) H1-antihistamine exposure events (runtime: ~40 min)
+      Ingredient-level ancestor concept IDs of H1 antihistamines */
+DROP TABLE IF EXISTS urticaria_h1_events;
+CREATE TEMP TABLE urticaria_h1_events AS
+SELECT
+  de.person_id,
+  de.drug_exposure_start_date::date AS rx_date,
+  de.drug_concept_id                AS rx_concept_id
+FROM drug_exposure_2023 de
+WHERE de.person_id IN (SELECT DISTINCT person_id FROM search_window_1_7)
+  AND de.drug_concept_id IN (
+    SELECT descendant_concept_id
+    FROM cdm.concept_ancestor
+    WHERE ancestor_concept_id IN (
+      1130863, 1192710, 19028947, 933952, 1105889, 1140123, 19081195, 909358,
+      994341, 19071314, 1149196, 1136422, 777221, 1133993, 1110727, 19090000,
+      986117, 1150770, 44012547, 1103006, 19092433, 1153428, 907553, 1107830,
+      19086100, 915855, 36879144, 1150836, 1141018, 1197677, 928744, 1129625,
+      738818, 1123904, 951237, 1159811, 1105853, 19009250, 1153013, 738156,
+      934075, 903893, 943634
+    )
+  );
+
+
+/* U4) Pair dx with subsequent rx (rx_date >= dx_date + 1 day)
+      hoi_date = rx_date */
+DROP TABLE IF EXISTS urticaria_hoi_events;
+CREATE TEMP TABLE urticaria_hoi_events AS
+SELECT
+  d.person_id,
+  d.dx_date,
+  d.dx_concept_id,
+  r.rx_date,
+  r.rx_concept_id,
+  r.rx_date AS hoi_date,
+  'dx_and_drug' AS hoi_type
+FROM urticaria_dx_events d
+JOIN urticaria_h1_events r
+  ON r.person_id = d.person_id
+ AND r.rx_date >= (d.dx_date + INTERVAL '1 day')::date;
+
+
+/* U5) Final: urticaria cohort with HOI flag (earliest HOI within window) */
+DROP TABLE IF EXISTS urti_base;
+CREATE TEMP TABLE urti_base AS
+SELECT
+  c.person_id,
+  c.index_date,
+  w.anchor_end_date,
+  w.search_start,
+  w.search_end
+FROM urti_cohort c
+JOIN search_window_1_7 w
+  ON w.person_id = c.person_id
+ AND w.index_date = c.index_date;
+
+DROP TABLE IF EXISTS urti_hoi_min;
+CREATE TEMP TABLE urti_hoi_min AS
+SELECT
+  b.person_id,
+  b.index_date,
+  MIN(h.hoi_date) AS hoi_date
+FROM urti_base b
+JOIN urticaria_hoi_events h
+  ON b.person_id = h.person_id
+ AND h.hoi_date BETWEEN b.search_start AND b.search_end
+GROUP BY b.person_id, b.index_date;
+
+DROP TABLE IF EXISTS urticaria_cohort_with_hoi;
+CREATE TEMP TABLE urticaria_cohort_with_hoi AS
+SELECT
+  b.person_id,
+  b.index_date,
+  b.anchor_end_date,
+  b.search_start,
+  b.search_end,
+  m.hoi_date,
+  CASE WHEN m.hoi_date IS NOT NULL THEN 1 ELSE 0 END AS hoi_flag
+FROM urti_base b
+LEFT JOIN urti_hoi_min m
+  ON m.person_id = b.person_id
+ AND m.index_date = b.index_date;
+
+
+/* =============================================================================
+   OUTCOME 3. MACE (Major Adverse Cardiovascular Events)
+   - Exclusion: MI / stroke / HF within 30 days before index_date
+   - Search window: (anchor_end + 1) ~ (anchor_end + 7)
+   - HOI (any of):
+       1) CV death: death.cause_source_value in ICD I20-I52
+       2) Nonfatal MI: MI dx (312327 + descendants) with no death record
+       3) Nonfatal stroke: stroke dx (381316 + descendants) with no death record
+   - Performance notes:
+       * Concept sets materialized as temp tables (avoids repeated
+         concept_ancestor subqueries)
+       * "No death" handled with NOT EXISTS
+       * First HOI per person/window fetched via LATERAL LIMIT 1
+   ============================================================================= */
+
+/* M0) Exclusion concept set: MI / stroke / HF (std + descendants) */
+DROP TABLE IF EXISTS seed_mace_excl_condition;
+CREATE TEMP TABLE seed_mace_excl_condition AS
+SELECT unnest(ARRAY[
+  312327, -- Myocardial infarction
+  381316, -- Stroke
+  316139  -- Heart failure
+]) AS concept_id;
+
+DROP TABLE IF EXISTS mace_excl_condition_concepts_std;
+CREATE TEMP TABLE mace_excl_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_mace_excl_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_mace_excl_condition;
+
+CREATE INDEX IF NOT EXISTS idx_mace_excl_cond_concept
+  ON mace_excl_condition_concepts_std(concept_id);
+ANALYZE mace_excl_condition_concepts_std;
+
+
+/* M1) Exclusion: MI/stroke/HF within 30 days before index_date */
+DROP TABLE IF EXISTS mace_cohort;
+CREATE TEMP TABLE mace_cohort AS
+SELECT bc.*
+FROM base_cohort bc
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM cdm.condition_occurrence co
+  WHERE co.person_id = bc.person_id
+    AND co.condition_concept_id IN (SELECT concept_id FROM mace_excl_condition_concepts_std)
+    AND co.condition_start_date::date BETWEEN (bc.index_date::date - INTERVAL '30 days')
+                                          AND (bc.index_date::date - INTERVAL '1 day')
+);
+
+CREATE INDEX IF NOT EXISTS idx_mace_cohort_pid_idx
+  ON mace_cohort(person_id, index_date);
+ANALYZE mace_cohort;
+
+
+/* M2) Prescriptions overlapping index_date */
+DROP TABLE IF EXISTS mace_exposure_on_index;
+CREATE TEMP TABLE mace_exposure_on_index AS
+SELECT
+  c.person_id,
+  c.index_date::date AS index_date,
+  d.drug_concept_id,
+  d.drug_exposure_start_date::date AS exposure_start_raw,
+  COALESCE(d.drug_exposure_end_date, d.drug_exposure_start_date)::date AS exposure_end_raw
+FROM mace_cohort c
+JOIN cdm.drug_exposure d
+  ON d.person_id = c.person_id
+ AND c.index_date::date BETWEEN d.drug_exposure_start_date::date
+                            AND COALESCE(d.drug_exposure_end_date, d.drug_exposure_start_date)::date
+WHERE d.drug_concept_id NOT IN (SELECT drug_concept_id FROM excluded_drug_descendants);
+
+CREATE INDEX IF NOT EXISTS idx_mace_exposure_on_index_pid_idx_end
+  ON mace_exposure_on_index(person_id, index_date, exposure_end_raw);
+ANALYZE mace_exposure_on_index;
+
+
+/* M3) Search window: (anchor_end + 1) ~ (anchor_end + 7) */
+DROP TABLE IF EXISTS mace_search_window;
+CREATE TEMP TABLE mace_search_window AS
+SELECT
+  person_id,
+  index_date,
+  MIN(exposure_end_raw) AS anchor_end_date,
+  (MIN(exposure_end_raw) + INTERVAL '1 day')::date AS search_start,
+  (MIN(exposure_end_raw) + INTERVAL '7 day')::date AS search_end
+FROM mace_exposure_on_index
+GROUP BY person_id, index_date;
+
+CREATE INDEX IF NOT EXISTS idx_mace_search_window_pid_idx
+  ON mace_search_window(person_id, index_date, search_start, search_end);
+ANALYZE mace_search_window;
+
+
+/* M4) MACE HOI events */
+-- Component concept sets: MI / stroke (std + descendants)
+DROP TABLE IF EXISTS cs_mi;
+CREATE TEMP TABLE cs_mi AS
+SELECT DISTINCT ca.descendant_concept_id AS concept_id
+FROM cdm.concept_ancestor ca
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE ca.ancestor_concept_id = 312327
+  AND c.domain_id = 'Condition' AND c.standard_concept = 'S'
+UNION SELECT 312327;
+
+DROP TABLE IF EXISTS cs_stroke;
+CREATE TEMP TABLE cs_stroke AS
+SELECT DISTINCT ca.descendant_concept_id AS concept_id
+FROM cdm.concept_ancestor ca
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE ca.ancestor_concept_id = 381316
+  AND c.domain_id = 'Condition' AND c.standard_concept = 'S'
+UNION SELECT 381316;
+
+CREATE INDEX IF NOT EXISTS idx_cs_mi ON cs_mi(concept_id);
+CREATE INDEX IF NOT EXISTS idx_cs_stroke ON cs_stroke(concept_id);
+ANALYZE cs_mi;
+ANALYZE cs_stroke;
+
+DROP TABLE IF EXISTS mace_hoi_events;
+CREATE TEMP TABLE mace_hoi_events AS
+-- 1) CV death (cause of death in ICD I20-I52)
+SELECT
+  d.person_id,
+  d.death_date::date AS hoi_date,
+  'cv_death' AS hoi_type
+FROM cdm.death d
+WHERE d.cause_source_value IN (
+  'I20','I21','I22','I23','I24','I25','I26','I27','I28','I29','I30',
+  'I31','I32','I33','I34','I35','I36','I37','I38','I39','I40','I41',
+  'I42','I43','I44','I45','I46','I47','I48','I49','I50','I51','I52'
+)
+UNION ALL
+-- 2) Nonfatal MI (no death record)
+SELECT
+  co.person_id,
+  co.condition_start_date::date AS hoi_date,
+  'nonfatal_mi' AS hoi_type
+FROM cdm.condition_occurrence co
+WHERE co.condition_concept_id IN (SELECT concept_id FROM cs_mi)
+  AND NOT EXISTS (SELECT 1 FROM cdm.death d WHERE d.person_id = co.person_id)
+UNION ALL
+-- 3) Nonfatal stroke (no death record)
+SELECT
+  co.person_id,
+  co.condition_start_date::date AS hoi_date,
+  'nonfatal_stroke' AS hoi_type
+FROM cdm.condition_occurrence co
+WHERE co.condition_concept_id IN (SELECT concept_id FROM cs_stroke)
+  AND NOT EXISTS (SELECT 1 FROM cdm.death d WHERE d.person_id = co.person_id);
+
+-- Critical index for the final window lookup
+CREATE INDEX IF NOT EXISTS idx_mace_hoi_events_pid_date
+  ON mace_hoi_events(person_id, hoi_date);
+ANALYZE mace_hoi_events;
+
+
+/* M5) Final: earliest HOI within window via LATERAL (one row per person/index) */
+DROP TABLE IF EXISTS mace_cohort_with_hoi;
+CREATE TEMP TABLE mace_cohort_with_hoi AS
+SELECT
+  c.person_id,
+  c.index_date,
+  w.anchor_end_date,
+  w.search_start,
+  w.search_end,
+  e.hoi_date,
+  e.hoi_type,
+  CASE WHEN e.hoi_date IS NOT NULL THEN 1 ELSE 0 END AS hoi_flag
+FROM mace_cohort c
+JOIN mace_search_window w
+  ON w.person_id = c.person_id
+ AND w.index_date = c.index_date
+LEFT JOIN LATERAL (
+  SELECT h.hoi_date, h.hoi_type
+  FROM mace_hoi_events h
+  WHERE h.person_id = c.person_id
+    AND h.hoi_date BETWEEN w.search_start AND w.search_end
+  ORDER BY h.hoi_date ASC, h.hoi_type ASC
+  LIMIT 1
+) e ON TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_mace_cohort_with_hoi_pid_idx
+  ON mace_cohort_with_hoi(person_id, index_date);
+ANALYZE mace_cohort_with_hoi;
+
+-- Validation:
+-- Persons without a search window (no prescription overlapping index_date):
+-- SELECT COUNT(*)
+-- FROM mace_cohort c
+-- LEFT JOIN mace_search_window w
+--   ON w.person_id = c.person_id AND w.index_date = c.index_date
+-- WHERE w.person_id IS NULL;
+--
+-- HOI incidence:
+-- SELECT hoi_flag, COUNT(*) FROM mace_cohort_with_hoi GROUP BY 1;
+
+
+/* =============================================================================
+   OUTCOME 4. ITCHING / PRURITUS
+   - Exclusion: itching/pruritus within 12 weeks before index_date
+     (conditions in the "excluded condition set" are NOT counted as itching)
+   - Search window: (anchor_end + 1) ~ (anchor_end + 7)  [reuses search_window_1_7]
+   - HOI: itching/pruritus dx within window (excluded condition set removed)
+   ============================================================================= */
+
+/* I0) Itching concept set (std + descendants) */
+DROP TABLE IF EXISTS seed_itching_condition;
+CREATE TEMP TABLE seed_itching_condition AS
+SELECT unnest(ARRAY[
+  4302654, -- Itching
+  136184   -- Pruritus
+]) AS concept_id;
+
+DROP TABLE IF EXISTS itching_condition_concepts_std;
+CREATE TEMP TABLE itching_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_itching_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_itching_condition;
+
+CREATE INDEX IF NOT EXISTS idx_itching_cond_cs
+  ON itching_condition_concepts_std(concept_id);
+ANALYZE itching_condition_concepts_std;
+
+
+/* I0-2) Excluded condition set (std + descendants)
+        Itching subtypes not considered part of the outcome */
+DROP TABLE IF EXISTS seed_itching_excluded_condition;
+CREATE TEMP TABLE seed_itching_excluded_condition AS
+SELECT unnest(ARRAY[
+  4082505, 4082504, 4296644
+]) AS concept_id;
+
+DROP TABLE IF EXISTS itching_excluded_concepts_std;
+CREATE TEMP TABLE itching_excluded_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_itching_excluded_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_itching_excluded_condition;
+
+CREATE INDEX IF NOT EXISTS idx_itching_excl_cs
+  ON itching_excluded_concepts_std(concept_id);
+ANALYZE itching_excluded_concepts_std;
+
+
+/* I1) Exclusion: itching/pruritus within 12 weeks before index_date
+      (excluded condition set removed via anti-join) */
+DROP TABLE IF EXISTS itching_cohort;
+CREATE TEMP TABLE itching_cohort AS
+SELECT bc.*
+FROM base_cohort bc
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM cdm.condition_occurrence co
+  JOIN itching_condition_concepts_std cs
+    ON cs.concept_id = co.condition_concept_id
+  LEFT JOIN itching_excluded_concepts_std x
+    ON x.concept_id = co.condition_concept_id
+  WHERE co.person_id = bc.person_id
+    AND x.concept_id IS NULL
+    AND co.condition_start_date::date BETWEEN (bc.index_date::date - INTERVAL '12 weeks')
+                                          AND (bc.index_date::date - INTERVAL '1 day')::date
+);
+
+CREATE INDEX IF NOT EXISTS idx_itching_cohort_pid_idx
+  ON itching_cohort(person_id, index_date);
+ANALYZE itching_cohort;
+
+
+/* I2) HOI events: itching/pruritus dx (excluded condition set removed) */
+DROP TABLE IF EXISTS itching_hoi_events;
+CREATE TEMP TABLE itching_hoi_events AS
+SELECT
+  co.person_id,
+  co.condition_start_date::date AS hoi_date,
+  co.condition_concept_id       AS hoi_concept_id,
+  'condition'                   AS hoi_type
+FROM cdm.condition_occurrence co
+JOIN itching_condition_concepts_std cs
+  ON cs.concept_id = co.condition_concept_id
+LEFT JOIN itching_excluded_concepts_std x
+  ON x.concept_id = co.condition_concept_id
+WHERE x.concept_id IS NULL;
+
+-- Critical index for the window lookup
+CREATE INDEX IF NOT EXISTS idx_itching_hoi_events_pid_date
+  ON itching_hoi_events(person_id, hoi_date);
+ANALYZE itching_hoi_events;
+
+
+/* I3) Final: earliest HOI within window via LATERAL */
+DROP TABLE IF EXISTS itching_cohort_with_hoi;
+CREATE TEMP TABLE itching_cohort_with_hoi AS
+SELECT
+  c.person_id,
+  c.index_date,
+  w.anchor_end_date,
+  w.search_start,
+  w.search_end,
+  e.hoi_date,
+  CASE WHEN e.hoi_date IS NOT NULL THEN 1 ELSE 0 END AS hoi_flag
+FROM itching_cohort c
+JOIN search_window_1_7 w
+  ON w.person_id = c.person_id
+ AND w.index_date = c.index_date
+LEFT JOIN LATERAL (
+  SELECT h.hoi_date
+  FROM itching_hoi_events h
+  WHERE h.person_id = c.person_id
+    AND h.hoi_date BETWEEN w.search_start AND w.search_end
+  ORDER BY h.hoi_date ASC
+  LIMIT 1
+) e ON TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_itching_cohort_with_hoi_pid_idx
+  ON itching_cohort_with_hoi(person_id, index_date);
+ANALYZE itching_cohort_with_hoi;
+
+-- Validation:
+-- SELECT hoi_flag, COUNT(*) FROM itching_cohort_with_hoi GROUP BY 1;
+
+
+/* =============================================================================
+   OUTCOME 5. AKI (Acute Kidney Injury)
+   -----------------------------------------------------------------------------
+   [Enrollment]
+     - At least 2 days of observation before index_date:
+         observation_period_start <= index_date - 2
+         observation_period_end   >= index_date
+
+   [Exclusion #1] Renal/urinary diagnosis
+     - Between index_date and index_date + 2:
+       ICD10/KCD6/KCD7 codes N00-N08, N10-N19, N25-N29, C64-C68
+       (concept_code seeds -> descendants -> standard concepts)
+
+   [Exclusion #2] eGFR < 60
+     - Any eGFR < 60 within index_date - 28 ~ index_date - 1
+     - eGFR = 175 * Scr^-1.154 * age^-0.203 * (0.742 if female)  [MDRD]
+
+   [Search window]
+     - anchor_end = earliest end date of prescriptions overlapping index_date
+     - window = (anchor_end + 3) ~ (anchor_end + 7)
+
+   [HOI] (any of)
+     1) Dx: drug-induced / acute kidney injury ICD/KCD codes within window
+     2) Serum creatinine (Scr, LOINC 2160-0):
+        baseline = value closest to index_date within index-30 ~ index+3
+                   (values on/before index_date preferred)
+        rule 1: increase >= 0.3 within 48h from search_start
+        rule 2: ratio >= 1.5x baseline within the search window
+     3) Procedure: dialysis-related EDI codes within window
+   ============================================================================= */
+
+/* A0) Enrollment by observation period */
+DROP TABLE IF EXISTS base_renal_cohort;
+CREATE TEMP TABLE base_renal_cohort AS
+SELECT bc.*
+FROM base_cohort bc
+WHERE EXISTS (
+  SELECT 1
+  FROM cdm.observation_period op
+  WHERE op.person_id = bc.person_id
+    AND op.observation_period_start_date::date <= (bc.index_date::date - INTERVAL '2 day')::date
+    AND op.observation_period_end_date::date   >= bc.index_date::date
+);
+
+
+/* A1) Exclusion #1: renal/urinary conditions
+      Seed by ICD10/KCD6/KCD7 concept_code, then expand to standard descendants */
+DROP TABLE IF EXISTS seed_renal_condition;
+CREATE TEMP TABLE seed_renal_condition AS
+SELECT DISTINCT c.concept_id
+FROM cdm.concept c
+WHERE c.vocabulary_id IN ('ICD10', 'KCD6', 'KCD7')
+  AND c.concept_code IN (
+    'N00','N01','N02','N03','N04','N05','N06','N07','N08',
+    'N10','N11','N12','N13','N14','N15','N16','N17','N18','N19',
+    'N25','N26','N27','N28','N29',
+    'C64','C65','C66','C67','C68'
+  );
+
+DROP TABLE IF EXISTS renal_condition_concepts_std;
+CREATE TEMP TABLE renal_condition_concepts_std AS
+SELECT ca.descendant_concept_id AS concept_id
+FROM seed_renal_condition s
+JOIN cdm.concept_ancestor ca ON ca.ancestor_concept_id = s.concept_id
+JOIN cdm.concept c ON c.concept_id = ca.descendant_concept_id
+WHERE c.domain_id = 'Condition'
+  AND c.standard_concept = 'S'
+UNION
+SELECT concept_id FROM seed_renal_condition;
+
+-- Apply Exclusion #1: renal/urinary dx within index_date ~ index_date + 2
+DROP TABLE IF EXISTS renal_cohort_1;
+CREATE TEMP TABLE renal_cohort_1 AS
+SELECT br.*
+FROM base_renal_cohort br
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM cdm.condition_occurrence co
+  WHERE co.person_id = br.person_id
+    AND co.condition_concept_id IN (SELECT concept_id FROM renal_condition_concepts_std)
+    AND co.condition_start_date::date BETWEEN br.index_date::date
+                                          AND (br.index_date::date + INTERVAL '2 day')::date
+);
+
+
+/* A2) Exclusion #2: eGFR < 60 within index_date - 28 ~ index_date - 1
+      (runtime: ~46 min) */
+
+-- Scr concept set (LOINC 2160-0)
+DROP TABLE IF EXISTS scr_concept;
+CREATE TEMP TABLE scr_concept AS
+SELECT concept_id
+FROM cdm.concept
+WHERE vocabulary_id = 'LOINC'
+  AND concept_code = '2160-0';
+
+-- Pre-filter measurement to the study period +/- margin (performance)
+DROP TABLE IF EXISTS renal_measurement_2019;
+CREATE TEMP TABLE renal_measurement_2019 AS
+SELECT DISTINCT person_id, measurement_concept_id, measurement_date, value_as_number
+FROM cdm.measurement
+WHERE measurement_date BETWEEN '2018-11-30' AND '2024-02-01';
+
+-- Scr measurements within index-28 ~ index-1 for renal_cohort_1
+DROP TABLE IF EXISTS scr_meas_pre28;
+CREATE TEMP TABLE scr_meas_pre28 AS
+SELECT
+  r.person_id,
+  r.index_date::date AS index_date,
+  r.age,
+  r.gender_source_value,
+  m.measurement_date::date AS measurement_date,
+  m.value_as_number        AS scr_value
+FROM renal_cohort_1 r
+JOIN renal_measurement_2019 m
+  ON m.person_id = r.person_id
+WHERE m.value_as_number IS NOT NULL
+  AND m.measurement_date::date BETWEEN (r.index_date::date - INTERVAL '28 day')::date
+                                   AND (r.index_date::date - INTERVAL '1 day')::date
+  AND m.measurement_concept_id IN (SELECT concept_id FROM scr_concept);
+
+-- Compute eGFR (MDRD); flag persons with any eGFR < 60
+DROP TABLE IF EXISTS aki_excl_egfr_lt60;
+CREATE TEMP TABLE aki_excl_egfr_lt60 AS
+SELECT DISTINCT s.person_id
+FROM (
+  SELECT
+    person_id,
+    measurement_date,
+    scr_value,
+    age,
+    gender_source_value,
+    175
+      * power(scr_value, -1.154)
+      * power(age, -0.203)
+      * CASE WHEN gender_source_value = 'F' THEN 0.742 ELSE 1 END
+      AS egfr_value
+  FROM scr_meas_pre28
+  WHERE age IS NOT NULL
+    AND age > 0
+    AND scr_value > 0
+) s
+WHERE s.egfr_value < 60;
+
+-- Final AKI cohort after both exclusions
+DROP TABLE IF EXISTS aki_cohort;
+CREATE TEMP TABLE aki_cohort AS
+SELECT r1.*
+FROM renal_cohort_1 r1
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM aki_excl_egfr_lt60 x
+  WHERE x.person_id = r1.person_id
+);
+
+
+/* A3) Search window: (anchor_end + 3) ~ (anchor_end + 7) */
+DROP TABLE IF EXISTS aki_search_window;
+CREATE TEMP TABLE aki_search_window AS
+SELECT
+  person_id,
+  index_date,
+  MIN(exposure_end_raw) AS anchor_end_date,
+  (MIN(exposure_end_raw) + INTERVAL '3 day')::date AS search_start,
+  (MIN(exposure_end_raw) + INTERVAL '7 day')::date AS search_end
+FROM exposure_on_index
+GROUP BY person_id, index_date;
+
+
+/* A4) HOI-1: AKI-related diagnosis (source ICD/KCD codes) within window */
+DROP TABLE IF EXISTS aki_hoi_dx;
+CREATE TEMP TABLE aki_hoi_dx AS
+SELECT
+  w.person_id,
+  MIN(co.condition_start_date::date) AS first_dx_date
+FROM aki_search_window w
+JOIN cdm.condition_occurrence co
+  ON co.person_id = w.person_id
+ AND co.condition_start_date::date BETWEEN w.search_start AND w.search_end
+WHERE co.condition_source_value IN (
+  'N10','N12','N14.1','N14.2','N15.8','N15.9',
+  'N17.0','N17.1','N17.2','N17.8','N17.9'
+)
+GROUP BY w.person_id;
+
+
+/* A5) HOI-2: Serum creatinine rules
+      Optimized: collect Scr measurements within the window once into a temp
+      table, then aggregate (avoids repeated correlated EXISTS scans). */
+
+-- Baseline Scr: closest value to index_date within index-30 ~ index+3,
+-- preferring values on/before index_date
+DROP TABLE IF EXISTS scr_baseline;
+CREATE TEMP TABLE scr_baseline AS
+SELECT
+  person_id,
+  index_date,
+  measurement_date,
+  baseline_scr
+FROM (
+  SELECT
+    c.person_id,
+    c.index_date::date AS index_date,
+    m.measurement_date::date AS measurement_date,
+    m.value_as_number AS baseline_scr,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.person_id, c.index_date::date
+      ORDER BY
+        CASE WHEN m.measurement_date::date <= c.index_date::date THEN 0 ELSE 1 END,  -- prefer pre-index
+        ABS(m.measurement_date::date - c.index_date::date) ASC,                      -- closest to index
+        m.measurement_date::date ASC
+    ) AS rn
+  FROM aki_cohort c
+  JOIN cdm.measurement m
+    ON m.person_id = c.person_id
+  WHERE m.value_as_number IS NOT NULL
+    AND m.measurement_date::date BETWEEN (c.index_date::date - INTERVAL '30 day')::date
+                                     AND (c.index_date::date + INTERVAL '3 day')::date
+    AND (
+      m.measurement_concept_id IN (SELECT concept_id FROM scr_concept)
+      OR m.measurement_source_value = '2160-0'  -- source fallback
+    )
+) s
+WHERE rn = 1;
+
+-- Materialize Scr concept IDs (avoids re-evaluating in joins)
+DROP TABLE IF EXISTS tmp_scr_concept;
+CREATE TEMP TABLE tmp_scr_concept AS
+SELECT concept_id FROM scr_concept;
+
+-- Collect all Scr measurements within the search window (single pass)
+DROP TABLE IF EXISTS tmp_scr_meas_in_window;
+CREATE TEMP TABLE tmp_scr_meas_in_window AS
+SELECT
+  w.person_id,
+  w.index_date,
+  w.search_start,
+  w.search_end,
+  b.baseline_scr,
+  m.measurement_date::timestamp AS meas_ts,
+  m.measurement_date::date      AS meas_dt,
+  m.value_as_number             AS scr
+FROM aki_search_window w
+JOIN scr_baseline b
+  ON b.person_id = w.person_id
+ AND b.index_date = w.index_date
+JOIN cdm.measurement m
+  ON m.person_id = w.person_id
+ AND m.value_as_number IS NOT NULL
+ AND m.measurement_concept_id IN (SELECT concept_id FROM tmp_scr_concept)
+ AND m.measurement_date::date BETWEEN w.search_start AND w.search_end;
+
+CREATE INDEX IF NOT EXISTS idx_tmp_scr_meas_pid_idxdate ON tmp_scr_meas_in_window (person_id, index_date);
+CREATE INDEX IF NOT EXISTS idx_tmp_scr_meas_pid_measts  ON tmp_scr_meas_in_window (person_id, meas_ts);
+
+-- Rule 1: delta >= 0.3 within 48h from search_start (one row per person/index)
+DROP TABLE IF EXISTS tmp_scr_rule_48h;
+CREATE TEMP TABLE tmp_scr_rule_48h AS
+SELECT
+  person_id,
+  index_date,
+  1 AS scr_rule_delta03_48h
+FROM tmp_scr_meas_in_window
+WHERE meas_ts BETWEEN search_start::timestamp
+                  AND search_start::timestamp + INTERVAL '48 hour'
+  AND (scr - baseline_scr) >= 0.3
+GROUP BY person_id, index_date;
+
+-- Rule 2: ratio >= 1.5x within the search window + first measurement date
+DROP TABLE IF EXISTS tmp_scr_rule_7d;
+CREATE TEMP TABLE tmp_scr_rule_7d AS
+SELECT
+  person_id,
+  index_date,
+  MAX(CASE WHEN (scr / NULLIF(baseline_scr, 0)) >= 1.5 THEN 1 ELSE 0 END) AS scr_rule_ratio15_7d,
+  MIN(meas_dt) AS first_scr_date_in_window
+FROM tmp_scr_meas_in_window
+GROUP BY person_id, index_date;
+
+-- Combine Scr rules
+DROP TABLE IF EXISTS aki_hoi_scr;
+CREATE TEMP TABLE aki_hoi_scr AS
+SELECT
+  w.person_id,
+  b.baseline_scr,
+  COALESCE(r48.scr_rule_delta03_48h, 0) AS scr_rule_delta03_48h,
+  COALESCE(r7.scr_rule_ratio15_7d, 0)   AS scr_rule_ratio15_7d,
+  r7.first_scr_date_in_window
+FROM aki_search_window w
+JOIN scr_baseline b
+  ON b.person_id = w.person_id
+ AND b.index_date = w.index_date
+LEFT JOIN tmp_scr_rule_48h r48
+  ON r48.person_id = w.person_id
+ AND r48.index_date = w.index_date
+LEFT JOIN tmp_scr_rule_7d r7
+  ON r7.person_id = w.person_id
+ AND r7.index_date = w.index_date;
+
+
+/* A6) HOI-3: dialysis-related treatment procedures (EDI codes) within window */
+DROP TABLE IF EXISTS aki_hoi_proc;
+CREATE TEMP TABLE aki_hoi_proc AS
+SELECT
+  w.person_id,
+  MIN(po.procedure_date::date) AS first_proc_date
+FROM aki_search_window w
+JOIN cdm.procedure_occurrence po
+  ON po.person_id = w.person_id
+ AND po.procedure_date::date BETWEEN w.search_start AND w.search_end
+WHERE po.procedure_source_value IN (
+  -- Venous catheterization for renal dialysis
+  'O7011','O7012','O7014','O7015','O7016','O7017','O7018',
+  -- Arteriovenostomy for renal dialysis
+  'O2011','O2012','O2081','O2082',
+  -- Hemodialysis
+  'O7020',
+  -- CRRT
+  'O7031','O7032','O7033','O7034','O7035','O7051','O7052','O7055'
+)
+GROUP BY w.person_id;
+
+
+/* A7) Final: AKI cohort with HOI flag
+      hoi_flag = dx OR Scr rule (either) OR procedure */
+DROP TABLE IF EXISTS aki_cohort_with_hoi;
+CREATE TEMP TABLE aki_cohort_with_hoi AS
+SELECT
+  c.person_id,
+  c.index_date::date AS index_date,
+  w.anchor_end_date,
+  w.search_start,
+  w.search_end,
+  -- Dx component
+  dx.first_dx_date,
+  -- Scr component
+  scr.baseline_scr,
+  scr.scr_rule_delta03_48h,
+  scr.scr_rule_ratio15_7d,
+  scr.first_scr_date_in_window,
+  -- Procedure component
+  pr.first_proc_date,
+  CASE
+    WHEN dx.person_id IS NOT NULL THEN 1
+    WHEN (scr.scr_rule_delta03_48h = 1 OR scr.scr_rule_ratio15_7d = 1) THEN 1
+    WHEN pr.person_id IS NOT NULL THEN 1
+    ELSE 0
+  END AS hoi_flag
+FROM aki_cohort c
+JOIN aki_search_window w
+  ON w.person_id = c.person_id
+ AND w.index_date = c.index_date
+LEFT JOIN aki_hoi_dx dx
+  ON dx.person_id = c.person_id
+LEFT JOIN aki_hoi_scr scr
+  ON scr.person_id = c.person_id
+LEFT JOIN aki_hoi_proc pr
+  ON pr.person_id = c.person_id;
