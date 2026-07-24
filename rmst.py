@@ -5,7 +5,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
-os.chdir('/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/data/input/')# enter input file directory
+os.chdir('')# enter input file directory
 
 # =========================================================================
 # 1. DYNAMICALLY GENERATE THE CONFIGURATION DICTIONARY
@@ -20,10 +20,10 @@ covariates_str = " + ".join(covariates)
 
 pps = ['pp0', 'pp1', 'pp2']
 endpoints = {
-    'aki': {'file': 'aki_df_260710.csv', 'tau': 4.0},
-    'mace': {'file': 'mace_df_260710.csv', 'tau': 6.0},
-    'itching': {'file': 'itching_df_260710.csv', 'tau': 6.0},
-    'urticaria': {'file': 'urticaria_df_260710.csv', 'tau': 6.0}
+    'aki': {'file': 'aki_df_filtered.csv', 'tau': 4.0},
+    'mace': {'file': 'mace_df_filtered.csv', 'tau': 6.0},
+    'itching': {'file': 'itching_df_filtered.csv', 'tau': 6.0},
+    'urticaria': {'file': 'urticaria_df_filtered.csv', 'tau': 6.0}
 }
 cohorts = ['older', 'younger', 'overall']
 model_types = ['covariatesadjusted', 'crude']
@@ -254,8 +254,8 @@ if all_results:
     final_results_df = final_results_df[col_order]
 
     # 5. Export to disk
-    output_path_csv = "/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/results/output/iptw_applied/rmst/RMST_Multiple_Jittering_Endpoints_Results.csv"
-    output_path_xlsx = "/Users/gracejuyun/Library/CloudStorage/Dropbox/asan/research/elderly_polypharm/CDM_internal_project/2023/results/output/iptw_applied/rmst/RMST_Multiple_Jittering_Endpoints_Results.xlsx"
+    output_path_csv = "RMST_Multiple_Jittering_Endpoints_Results.csv"
+    output_path_xlsx = "RMST_Multiple_Jittering_Endpoints_Results.xlsx"
     
     final_results_df.to_csv(output_path_csv, index=False)
     final_results_df.to_excel(output_path_xlsx, index=False)
